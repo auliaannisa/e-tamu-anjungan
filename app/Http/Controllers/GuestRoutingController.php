@@ -5,85 +5,104 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use App\Models\Department;
 use App\Models\Keyword;
-use App\Models\GuestRequest;
 
 class GuestRoutingController extends Controller
 {
-    // 1. Tampilan Halaman Utama Mesin Anjungan
+    /**
+     * 1. Menampilkan Form Input Tamu (GET /)
+     */
     public function index()
     {
         return view('anjungan.index');
     }
 
-    // 2. Proses Inti Algoritma Keyword Mapping & Smart Routing
+    /**
+     * 2. Memproses Data Diri & Keperluan Tamu (POST /process-routing)
+     */
     public function processRouting(Request $request)
     {
+        // Validasi input sesuai komponen pada gambar UI Anda
         $request->validate([
-            'guest_name' => 'required|string|max:255',
-            'purpose' => 'required|string',
+            'nik'          => 'required|numeric|digits_between:16,17',
+            'nama_lengkap' => 'required|string|max:150',
+            'instansi'     => 'required|string|max:150',
+            'nomor_hp'     => 'required|string|max:15',
+            'keperluan'    => 'required|string'
         ]);
 
-        $name = $request->guest_name;
-        $purpose = $request->purpose;
+        // Tampung data input ke dalam variabel
+        $nik         = $request->input('nik');
+        $namaLengkap = $request->input('nama_lengkap');
+        $instansi    = $request->input('instansi');
+        $nomorHp     = $request->input('nomor_hp');
+        $keperluan   = $request->input('keperluan');
+
+        // --- TAHAP 1: PREPROCESSING TEKS & HITUNG TOTAL KATA ---
+        $teksBersih = strtolower($keperluan);
+        $teksBersih = preg_replace('/[^a-zA-Z0-9\s]/', '', $teksBersih);
         
-        // Pembersihan input kalimat (diubah jadi huruf kecil semua agar case-insensitive)
-        $clean_input = strtolower($purpose);
+        $arrayKata = array_filter(explode(' ', $teksBersih));
+        $totalKataInput = count($arrayKata) > 0 ? count($arrayKata) : 1;
 
-        // Ambil semua kata kunci yang ada di database
-        $allKeywords = Keyword::all();
-        $scores = [];
-        $matched_words = [];
+        // --- TAHAP 2: AMBIL DATA MASTER ---
+        $masterKeywords = Keyword::with('department')->get();
+        $semuaBidang = Department::all();
 
-        // Inisialisasi skor kecocokan awal untuk setiap bidang = 0
-        $departments = Department::all();
-        foreach ($departments as $dept) {
-            $scores[$dept->id] = 0;
-            $matched_words[$dept->id] = [];
+        // --- TAHAP 3: INISIALISASI SKOR ---
+        $skorBidang = [];
+        foreach ($semuaBidang as $bidang) {
+            $skorBidang[$bidang->code] = [
+                'id_bidang' => $bidang->id,
+                'nama_bidang' => $bidang->name,
+                'skor' => 0
+            ];
         }
 
-        // Jalankan Algoritma Keyword Mapping
-        foreach ($allKeywords as $kw) {
-            // Jika kata kunci terdeteksi di dalam kalimat input tamu
-            if (str_contains($clean_input, $kw->keyword_word)) {
-                $scores[$kw->department_id] += 1; // Naikkan poin bidang terkait
-                $matched_words[$kw->department_id][] = $kw->keyword_word; // Catat kata yang cocok
+        // --- TAHAP 4: ALGORITMA KEYWORD MAPPING (SCORING) ---
+        $jumlahKataKunciCocok = 0;
+        foreach ($masterKeywords as $item) {
+            if ($item->department && str_contains($teksBersih, $item->keyword_word)) {
+                $skorBidang[$item->department->code]['skor'] += 1;
+                $jumlahKataKunciCocok += count(explode(' ', $item->keyword_word));
             }
         }
 
-        // Urutkan skor dari yang paling tinggi ke rendah
-        arsort($scores);
-        $best_dept_id = key($scores);
-        $highest_score = current($scores);
+        // --- TAHAP 5: PENENTUAN BIDANG TERBAIK ---
+        $bidangRekomendasi = null;
+        $skorMaksimal = 0;
 
-        // Aturan khusus: Jika tidak ada satupun kata kunci yang cocok (skor = 0)
-        if ($highest_score == 0) {
-            // Alihkan otomatis sebagai tamu umum ke Sekretariat
-            $default_dept = Department::where('code', 'Sekretariat')->first();
-            $best_dept_id = $default_dept ? $default_dept->id : null;
-            $accuracy = 0;
-        } else {
-            // Perhitungan Akurasi: (Jumlah kata yang cocok / Total kata kunci bidang tersebut) * 100
-            $total_dept_keywords = Keyword::where('department_id', $best_dept_id)->count();
-            $accuracy = ($highest_score / $total_dept_keywords) * 100;
-            $accuracy = $accuracy > 100 ? 100 : round($accuracy, 2);
+        foreach ($skorBidang as $kode => $data) {
+            if ($data['skor'] > $skorMaksimal) {
+                $skorMaksimal = $data['skor'];
+                $bidangRekomendasi = [
+                    'kode_bidang' => $kode,
+                    'nama_bidang' => $data['nama_bidang'],
+                    'skor_mentah' => $skorMaksimal
+                ];
+            }
         }
 
-        // Simpan riwayat kunjungan tamu ke database tabel guest_requests
-        $guestLog = GuestRequest::create([
-            'guest_name' => $name,
-            'purpose' => $purpose,
-            'matched_department_id' => $best_dept_id,
-            'accuracy_score' => $accuracy
-        ]);
+        // --- TAHAP 6: HANDLING JIKA TIDAK COCOK & PERSENTASE AKURASI ---
+        if ($skorMaksimal === 0) {
+            $bidangRekomendasi = [
+                'kode_bidang' => 'SEKRETARIAT',
+                'nama_bidang' => 'Sekretariat (Pusat Informasi Umum)',
+                'persentase_akurasi' => 0
+            ];
+        } else {
+            $persentase = ($jumlahKataKunciCocok / $totalKataInput) * 100;
+            $bidangRekomendasi['persentase_akurasi'] = min(round($persentase), 100);
+        }
 
-        // Ambil data detail bidang pemenang untuk ditampilkan di layar
-        $recommended_department = Department::find($best_dept_id);
-
+        // --- TAHAP 7: OPER DATA LENGKAP KE HALAMAN HASIL ---
         return view('anjungan.result', [
-            'guest' => $guestLog,
-            'department' => $recommended_department,
-            'accuracy' => $accuracy,
-            'matched_words' => $matched_words[$best_dept_id] ?? []
+            'nik'             => $nik,
+            'nama_lengkap'    => $namaLengkap,
+            'instansi'        => $instansi,
+            'nomor_hp'        => $nomorHp,
+            'input_keperluan' => $keperluan,
+            'rekomendasi'     => $bidangRekomendasi,
+            'log_skor'        => $skorBidang
         ]);
     }
 }
